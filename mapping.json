@@ -1,10 +1,22 @@
 {
   "t2-bs": "t2-common",
   "t2-ft": "t2-common",
+  "t2-imb": "t2-common",
+  "t2-tk": "t2-common",
+  
   "t3-bs": "t3-common",
   "t3-ft": "t3-common",
+  "t3-tk": "t3-common",
+  "t3-imb": "t3-common",
+
   "t4-bs": "t4-bs",
   "t4-ft": "t4-ft",
+  "t4-imb": "t4-imb",
+  "t4-tk": "t4-tk",
+
   "t5-bs": "t5-bs",
-  "t5-ft": "t5-ft"
+  "t5-ft": "t5-ft",
+
+  "t6-bs": "settings",
+  "t6-ft": "settings"
 }

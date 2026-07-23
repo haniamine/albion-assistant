@@ -39,15 +39,18 @@ ADVANCE_TIER_RESTORE_DELAY_SECONDS = 0.30
 READY_TIMEOUT_SECONDS = 0.50
 ACCEPT_TIMEOUT_SECONDS = 1.00
 ACCEPT_RETRY_ATTEMPTS = 2
-PREFETCH_LABORER_WAIT_SECONDS = 0.05
+PREFETCH_LABORER_WAIT_SECONDS = 1.50
+LABORER_HINT_PADDING = 120
 TAKE_ALL_NOT_FOUND_DELAY_SECONDS = 0.10
-SHIFT_MOVE_DELAY_SECONDS = 0.05
+SHIFT_MOVE_DELAY_SECONDS = 0.12
 SHIFT_BEFORE_CLICK_DELAY_SECONDS = 0.05
 SHIFT_CLICK_COUNT = 2
 SHIFT_CLICK_HOLD_SECONDS = 0.06
 SHIFT_CLICK_GAP_SECONDS = 0.05
 SHIFT_AFTER_CLICK_HOLD_SECONDS = 0.10
 SHIFT_RELEASE_DELAY_SECONDS = 0.04
+SHIFT_CLICK_RETRY_ATTEMPTS = 3
+SHIFT_CLICK_VERIFY_DELAY_SECONDS = 0.15
 RESTORE_MOUSE_DELAY_SECONDS = 0.30
 CURSOR_MOVE_ATTEMPTS = 3
 CURSOR_SETTLE_SECONDS = 0.02
@@ -60,8 +63,9 @@ LOG_LABORER_SCORES = False
 STOP_LABORER_PREFIX = "t6-"
 STOP_LABORER_BEEP_FREQUENCY = 1200
 STOP_LABORER_BEEP_DURATION_MS = 350
-STOP_LABORER_BADGE_REGION = (0, 0, 34, 34)
-STOP_LABORER_BADGE_THRESHOLD = 0.85
+LABORER_BADGE_REGION = (0, 0, 34, 34)
+LABORER_BADGE_THRESHOLD = 0.85
+LABORER_BADGE_COLOR_MAX_DISTANCE = 25.0
 
 VK_1 = 0x31
 VK_2 = 0x32
@@ -81,7 +85,7 @@ MOUSEEVENTF_LEFTUP = 0x0004
 
 ImageMapping = Dict[str, Dict[str, Path]]
 JournalPositionCache = Dict[str, Tuple[int, int]]
-LaborerMatch = Tuple[str, float, int]
+LaborerMatch = Tuple[str, float, int, Tuple[int, int]]
 
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 
@@ -139,6 +143,13 @@ class MaskedTemplate:
 class TemplateSearchHint:
     position: Optional[Tuple[int, int]] = None
     monitor_index: Optional[int] = None
+
+
+@dataclass
+class LaborerSearchHint:
+    position: Optional[Tuple[int, int]] = None
+    monitor_index: Optional[int] = None
+    laborer_name: Optional[str] = None
 
 
 TemplateMapping = Dict[str, MaskedTemplate]
@@ -275,6 +286,37 @@ def iter_captured_screens(preferred_monitor_index: Optional[int] = None):
         for monitor_index in ordered_monitor_indexes(screen_capture, preferred_monitor_index):
             source, origin = capture_monitor_source(screen_capture, monitor_index)
             yield monitor_index, source, origin
+
+
+def capture_source_with_color(
+    screen_capture: mss.mss,
+    region: dict[str, int],
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    screenshot = np.array(screen_capture.grab(region))
+    gray = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2GRAY)
+    color = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
+    return gray, color, (region["left"], region["top"])
+
+
+def capture_monitor_source_with_color(
+    screen_capture: mss.mss,
+    monitor_index: int,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    return capture_source_with_color(screen_capture, screen_capture.monitors[monitor_index])
+
+
+def capture_screen_by_index_with_color(
+    monitor_index: int,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    with mss.mss() as screen_capture:
+        return capture_monitor_source_with_color(screen_capture, monitor_index)
+
+
+def iter_captured_screens_with_color(preferred_monitor_index: Optional[int] = None):
+    with mss.mss() as screen_capture:
+        for monitor_index in ordered_monitor_indexes(screen_capture, preferred_monitor_index):
+            gray, color, origin = capture_monitor_source_with_color(screen_capture, monitor_index)
+            yield monitor_index, gray, color, origin
 
 
 def template_match_score(
@@ -599,20 +641,62 @@ def wait_for_ctrl_release(timeout_seconds: float = MODIFIER_RELEASE_TIMEOUT_SECO
         time.sleep(POLL_SECONDS)
 
 
-def shift_click(position: Tuple[int, int]) -> None:
+def shift_click(position: Tuple[int, int]) -> bool:
     wait_for_ctrl_release()
     move_cursor(position)
     time.sleep(SHIFT_MOVE_DELAY_SECONDS)
     shift_down()
+    all_registered = True
     try:
         time.sleep(SHIFT_BEFORE_CLICK_DELAY_SECONDS)
         for _ in range(SHIFT_CLICK_COUNT):
+            # Shift can drop between clicks (game steals focus, OS coalesces
+            # key state, etc.). Re-press it before any click that would
+            # otherwise land as an unmodified click and move a single item.
+            if not is_shift_registered():
+                print("shift dropped mid-click, re-pressing before click.")
+                shift_down()
+                if not is_shift_registered():
+                    all_registered = False
+                    # GetAsyncKeyState only confirms the OS accepted our own
+                    # injected key state, not that the game saw it - but if
+                    # it can't even confirm that much, firing the click
+                    # unmodified would silently move a single item instead
+                    # of nothing, which is worse for the caller's retry logic.
+                    print("shift still unregistered, skipping this click.")
+                    continue
             send_left_click(hold_seconds=SHIFT_CLICK_HOLD_SECONDS)
             time.sleep(SHIFT_CLICK_GAP_SECONDS)
         time.sleep(SHIFT_AFTER_CLICK_HOLD_SECONDS)
     finally:
         shift_up()
         time.sleep(SHIFT_RELEASE_DELAY_SECONDS)
+
+    if not all_registered:
+        print("shift-click finished without confirmed shift on every click.")
+    return all_registered
+
+
+def shift_click_journal(
+    position: Tuple[int, int],
+    journal_template: MaskedTemplate,
+    attempts: int = SHIFT_CLICK_RETRY_ATTEMPTS,
+) -> bool:
+    # shift_click()'s own return value only confirms the OS accepted our
+    # injected shift key state - it can't confirm the game actually acted on
+    # it, so it's true almost every time and can't drive a retry. The only
+    # reliable signal is the game's own state: is the journal actually gone
+    # from this slot after we clicked it. Retry against that instead.
+    for attempt in range(attempts):
+        shift_click(position)
+        time.sleep(SHIFT_CLICK_VERIFY_DELAY_SECONDS)
+        if not journal_at_position(journal_template, position):
+            return True
+        if attempt < attempts - 1:
+            print(f"journal still present after shift-click, retrying ({attempt + 2}/{attempts}).")
+
+    print("journal still present after all shift-click retries; giving up.")
+    return False
 
 
 def find_template_until(
@@ -709,6 +793,26 @@ def load_laborer_templates(mapping: ImageMapping) -> TemplateMapping:
     return templates
 
 
+def filter_laborer_templates_by_inventory(
+    laborer_templates: TemplateMapping,
+    mapping: ImageMapping,
+    journal_positions: JournalPositionCache,
+) -> TemplateMapping:
+    # Only journals actually present in the inventory (as of the last '2' scan)
+    # are real candidates, so narrowing the search to those tiers rules out
+    # look-alike tiers (e.g. t2 vs t5 of the same profession) you don't even
+    # have a journal for. Stop laborers are exempt: they don't need a journal.
+    filtered: TemplateMapping = {}
+    for laborer_name, template in laborer_templates.items():
+        if is_stop_laborer(laborer_name):
+            filtered[laborer_name] = template
+            continue
+        paths = mapping.get(laborer_name)
+        if paths is not None and paths["journal"].stem in journal_positions:
+            filtered[laborer_name] = template
+    return filtered
+
+
 def load_journal_templates(mapping: ImageMapping) -> TemplateMapping:
     templates: TemplateMapping = {}
     for laborer_name, paths in mapping.items():
@@ -787,26 +891,95 @@ def masked_fixed_region_score(
     return max_val
 
 
-def is_verified_stop_laborer_match(
+def is_verified_laborer_match(
     source: np.ndarray,
     laborer_name: str,
     template: MaskedTemplate,
     max_loc: Tuple[int, int],
 ) -> bool:
-    if not is_stop_laborer(laborer_name):
-        return False
-
+    # Different tiers of the same laborer share almost identical art aside from
+    # the small tier badge in the corner, so an overall score above threshold
+    # can still be the wrong tier (e.g. t2 matching a t5 icon). Verify the
+    # fixed badge region separately against this candidate's own template.
     badge_score = masked_fixed_region_score(
         source,
         template,
         max_loc,
-        STOP_LABORER_BADGE_REGION,
+        LABORER_BADGE_REGION,
     )
-    if badge_score >= STOP_LABORER_BADGE_THRESHOLD:
+    if badge_score >= LABORER_BADGE_THRESHOLD:
         return True
 
-    print(f"rejected stop laborer candidate {laborer_name}: badge score {badge_score:.3f}.")
+    print(f"rejected {laborer_name} candidate: tier badge score {badge_score:.3f}.")
     return False
+
+
+BadgeColor = Tuple[float, float, float]
+LaborerBadgeColors = Dict[str, BadgeColor]
+
+
+def compute_badge_reference_color(
+    path: Path,
+    region: Tuple[int, int, int, int] = LABORER_BADGE_REGION,
+) -> Optional[BadgeColor]:
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        return None
+    if image.ndim == 3 and image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    region_x, region_y, region_width, region_height = region
+    crop = image[region_y:region_y + region_height, region_x:region_x + region_width]
+    if crop.shape[0] != region_height or crop.shape[1] != region_width:
+        return None
+    return (
+        float(np.median(crop[:, :, 0])),
+        float(np.median(crop[:, :, 1])),
+        float(np.median(crop[:, :, 2])),
+    )
+
+
+def load_laborer_badge_colors(mapping: ImageMapping) -> LaborerBadgeColors:
+    # The tier badge's color (e.g. t3 green vs t4 blue) is far more
+    # discriminative than its grayscale shape - same-profession tiers share
+    # almost identical art and their badge shapes correlate deceptively well
+    # in grayscale (see is_verified_laborer_match), but their colors are
+    # reliably tens of BGR units apart.
+    colors: LaborerBadgeColors = {}
+    for laborer_name, paths in mapping.items():
+        color = compute_badge_reference_color(paths["laborer"])
+        if color is not None:
+            colors[laborer_name] = color
+
+    for laborer_path in sorted(LABORER_ASSETS_DIR.glob(f"{STOP_LABORER_PREFIX}*.png")):
+        laborer_name = laborer_path.stem
+        if laborer_name not in colors:
+            color = compute_badge_reference_color(laborer_path)
+            if color is not None:
+                colors[laborer_name] = color
+
+    return colors
+
+
+def masked_region_median_color(
+    color_source: np.ndarray,
+    top_left: Tuple[int, int],
+    region: Tuple[int, int, int, int],
+) -> Optional[BadgeColor]:
+    region_x, region_y, region_width, region_height = region
+    x = top_left[0] + region_x
+    y = top_left[1] + region_y
+    crop = color_source[y:y + region_height, x:x + region_width]
+    if crop.shape[0] != region_height or crop.shape[1] != region_width:
+        return None
+    return (
+        float(np.median(crop[:, :, 0])),
+        float(np.median(crop[:, :, 1])),
+        float(np.median(crop[:, :, 2])),
+    )
+
+
+def badge_color_distance(a: BadgeColor, b: BadgeColor) -> float:
+    return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
 
 
 def scan_inventory_journal_positions(journal_templates: TemplateMapping) -> JournalPositionCache:
@@ -857,69 +1030,205 @@ def ordered_template_names(
             yield template_name
 
 
+def laborer_profession_suffix(laborer_name: str) -> str:
+    _tier, _sep, suffix = laborer_name.partition("-")
+    return suffix
+
+
 def find_laborer_in_source(
     laborer_templates: TemplateMapping,
     source: np.ndarray,
+    origin: Tuple[int, int],
     monitor_index: int,
     preferred_laborer_name: Optional[str] = None,
+    color_source: Optional[np.ndarray] = None,
+    badge_colors: Optional[LaborerBadgeColors] = None,
 ) -> Optional[LaborerMatch]:
-    best_name: Optional[str] = None
-    best_score = 0.0
+    # Different tiers of the same profession (e.g. t2-bs vs t5-bs) share almost
+    # identical art - frame, background, weapon - aside from the small tier
+    # badge and the portrait. TM_SQDIFF_NORMED over the whole image can score
+    # the wrong tier above threshold because the shared frame dominates the
+    # pixel count, and even the badge's grayscale *shape* can correlate
+    # deceptively well between two different tier numerals (e.g. III vs IV
+    # can score ~0.86, above the 0.85 gate). The badge's *color* is what
+    # actually reliably differs between tiers, so when a color capture is
+    # available it settles same-profession ties instead of the shape score.
+    candidates: Dict[str, Tuple[float, Tuple[int, int], Tuple[int, int]]] = {}
     best_stop_match: Optional[LaborerMatch] = None
+    best_overall_score = 0.0
 
     for laborer_name in ordered_template_names(laborer_templates, preferred_laborer_name):
         template = laborer_templates[laborer_name]
         score, max_loc = masked_template_match(source, template)
         if LOG_LABORER_SCORES:
             print(f"laborer score {laborer_name} on monitor {monitor_index}: {score:.3f}")
-        if is_stop_laborer(laborer_name):
-            if (
-                score >= LABORER_MATCH_THRESHOLD
-                and is_verified_stop_laborer_match(source, laborer_name, template, max_loc)
-                and (best_stop_match is None or score > best_stop_match[1])
-            ):
-                best_stop_match = (laborer_name, score, monitor_index)
+        if score < LABORER_MATCH_THRESHOLD:
             continue
 
-        if score > best_score:
-            best_name = laborer_name
-            best_score = score
+        height, width = template.image.shape[:2]
+        position = (
+            origin[0] + max_loc[0] + width // 2,
+            origin[1] + max_loc[1] + height // 2,
+        )
 
-    if best_stop_match is not None and best_stop_match[1] >= best_score:
+        if is_stop_laborer(laborer_name):
+            if not is_verified_laborer_match(source, laborer_name, template, max_loc):
+                continue
+            if best_stop_match is None or score > best_stop_match[1]:
+                best_stop_match = (laborer_name, score, monitor_index, position)
+            continue
+
+        candidates[laborer_name] = (score, max_loc, position)
+        best_overall_score = max(best_overall_score, score)
+
+    if best_stop_match is not None and (not candidates or best_stop_match[1] >= best_overall_score):
         return best_stop_match
 
-    if best_name is None or best_score < LABORER_MATCH_THRESHOLD:
+    if not candidates:
         return None
-    return best_name, best_score, monitor_index
+
+    top_name = max(candidates, key=lambda name: candidates[name][0])
+
+    if color_source is None or badge_colors is None:
+        # No color capture available (e.g. called without the color-aware
+        # capture path): fall back to the less reliable grayscale badge shape
+        # check as a best-effort verification of the top overall match.
+        score, max_loc, position = candidates[top_name]
+        template = laborer_templates[top_name]
+        if not is_verified_laborer_match(source, top_name, template, max_loc):
+            return None
+        return top_name, score, monitor_index, position
+
+    top_suffix = laborer_profession_suffix(top_name)
+    sibling_names = [
+        name for name in candidates if laborer_profession_suffix(name) == top_suffix
+    ]
+
+    best_name: Optional[str] = None
+    best_distance: Optional[float] = None
+    for name in sibling_names:
+        reference_color = badge_colors.get(name)
+        if reference_color is None:
+            continue
+        _score, max_loc, _position = candidates[name]
+        observed_color = masked_region_median_color(color_source, max_loc, LABORER_BADGE_REGION)
+        if observed_color is None:
+            continue
+        distance = badge_color_distance(reference_color, observed_color)
+        if LOG_LABORER_SCORES:
+            print(f"laborer badge color distance {name} on monitor {monitor_index}: {distance:.1f}")
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_name = name
+
+    if best_name is None or best_distance is None or best_distance > LABORER_BADGE_COLOR_MAX_DISTANCE:
+        print(f"rejected {top_name} candidate: tier badge color distance {best_distance}.")
+        return None
+
+    best_score, _max_loc, best_position = candidates[best_name]
+    return best_name, best_score, monitor_index, best_position
+
+
+def remember_laborer_match(
+    hint: Optional[LaborerSearchHint],
+    match: Optional[LaborerMatch],
+) -> None:
+    if hint is None or match is None:
+        return
+
+    laborer_name, _score, monitor_index, position = match
+    hint.laborer_name = laborer_name
+    hint.monitor_index = monitor_index
+    hint.position = position
+
+
+def find_laborer_from_hint(
+    laborer_templates: TemplateMapping,
+    hint: Optional[LaborerSearchHint],
+    badge_colors: Optional[LaborerBadgeColors] = None,
+) -> Optional[LaborerMatch]:
+    if hint is None or hint.position is None or hint.monitor_index is None:
+        return None
+    if hint.laborer_name not in laborer_templates:
+        return None
+
+    hint_template = laborer_templates[hint.laborer_name].image
+    with mss.mss() as screen_capture:
+        if hint.monitor_index <= 0 or hint.monitor_index >= len(screen_capture.monitors):
+            return None
+        region = template_hint_region(
+            screen_capture.monitors[hint.monitor_index],
+            hint.position,
+            hint_template,
+            padding=LABORER_HINT_PADDING,
+        )
+        if region is None:
+            return None
+        source, color_source, origin = capture_source_with_color(screen_capture, region)
+
+    match = find_laborer_in_source(
+        laborer_templates,
+        source,
+        origin,
+        hint.monitor_index,
+        hint.laborer_name,
+        color_source,
+        badge_colors,
+    )
+    if match is not None:
+        remember_laborer_match(hint, match)
+        print(f"laborer matched near last position ({match[1]:.3f}).")
+    return match
 
 
 def find_laborer(
     laborer_templates: TemplateMapping,
     monitor_index: int,
     preferred_laborer_name: Optional[str] = None,
+    hint: Optional[LaborerSearchHint] = None,
+    badge_colors: Optional[LaborerBadgeColors] = None,
 ) -> Optional[LaborerMatch]:
-    source, _origin = capture_screen_by_index(monitor_index)
-    return find_laborer_in_source(
+    if hint is not None and hint.monitor_index == monitor_index:
+        hint_match = find_laborer_from_hint(laborer_templates, hint, badge_colors)
+        if hint_match is not None:
+            return hint_match
+
+    source, color_source, origin = capture_screen_by_index_with_color(monitor_index)
+    match = find_laborer_in_source(
         laborer_templates,
         source,
+        origin,
         monitor_index,
         preferred_laborer_name,
+        color_source,
+        badge_colors,
     )
+    remember_laborer_match(hint, match)
+    return match
 
 
 def find_laborer_on_screens(
     laborer_templates: TemplateMapping,
     preferred_laborer_name: Optional[str] = None,
     preferred_monitor_index: Optional[int] = None,
+    hint: Optional[LaborerSearchHint] = None,
+    badge_colors: Optional[LaborerBadgeColors] = None,
 ) -> Optional[LaborerMatch]:
+    hint_match = find_laborer_from_hint(laborer_templates, hint, badge_colors)
+    if hint_match is not None:
+        return hint_match
+
     best_match: Optional[LaborerMatch] = None
 
-    for monitor_index, source, _origin in iter_captured_screens(preferred_monitor_index):
+    for monitor_index, source, color_source, origin in iter_captured_screens_with_color(preferred_monitor_index):
         laborer_match = find_laborer_in_source(
             laborer_templates,
             source,
+            origin,
             monitor_index,
             preferred_laborer_name,
+            color_source,
+            badge_colors,
         )
         if laborer_match is None:
             continue
@@ -928,11 +1237,13 @@ def find_laborer_on_screens(
             laborer_match[0] == preferred_laborer_name
             and (preferred_monitor_index is None or monitor_index == preferred_monitor_index)
         ):
+            remember_laborer_match(hint, laborer_match)
             return laborer_match
 
         if best_match is None or laborer_match[1] > best_match[1]:
             best_match = laborer_match
 
+    remember_laborer_match(hint, best_match)
     return best_match
 
 
@@ -959,13 +1270,15 @@ def check_laborer(
     laborer_templates: TemplateMapping,
     monitor_index: int,
     preferred_laborer_name: Optional[str] = None,
+    hint: Optional[LaborerSearchHint] = None,
+    badge_colors: Optional[LaborerBadgeColors] = None,
 ) -> Optional[Tuple[str, int]]:
-    laborer_match = find_laborer(laborer_templates, monitor_index, preferred_laborer_name)
+    laborer_match = find_laborer(laborer_templates, monitor_index, preferred_laborer_name, hint, badge_colors)
     if laborer_match is None:
         print("laborer image not found.")
         return None
 
-    laborer_name, score, monitor_index = laborer_match
+    laborer_name, score, monitor_index, _position = laborer_match
     print(f"laborer image found: {laborer_name} on monitor {monitor_index} ({score:.3f})")
     return laborer_name, monitor_index
 
@@ -987,7 +1300,7 @@ def get_prefetched_laborer(
         print("prefetched laborer image not found.")
         return None
 
-    laborer_name, score, matched_monitor_index = laborer_match
+    laborer_name, score, matched_monitor_index, _position = laborer_match
     if matched_monitor_index != monitor_index:
         print(
             "prefetched laborer monitor mismatch "
@@ -1034,7 +1347,7 @@ def select_journal(
     if cached_position is not None:
         if journal_at_position(journal_template, cached_position):
             print(f"using cached journal position for {journal_name}: {cached_position}.")
-            shift_click(cached_position)
+            shift_click_journal(cached_position, journal_template)
             print(f"shift-clicked cached journal for {laborer_name}.")
             return cached_position
 
@@ -1054,7 +1367,7 @@ def select_journal(
     if journal_positions_path is not None:
         save_journal_positions(journal_positions_path, journal_positions)
         print(f"cached journal position for {journal_name}.")
-    shift_click(journal_position)
+    shift_click_journal(journal_position, journal_template)
     print(f"shift-clicked journal twice for {laborer_name} ({score:.3f}).")
     return journal_position
 
@@ -1092,10 +1405,12 @@ def main() -> None:
     ready_template = load_template(READY_IMAGE)
     accept_template = load_template(ACCEPT_IMAGE)
     laborer_templates = load_laborer_templates(mapping)
+    laborer_badge_colors = load_laborer_badge_colors(mapping)
     journal_templates = load_journal_templates(mapping)
     journal_templates_by_name = load_journal_templates_by_name(mapping)
     journal_positions = load_journal_positions(JOURNAL_POSITIONS_FILE)
     print("Listening for '&' / '1' / Ctrl+C. Press '2' to scan journal positions. Press superscript-2 to stop.")
+    print("'1' / Ctrl+C is blocked until at least one journal position is cached via '2'.")
     print(f"Loaded {len(mapping)} laborer mapping(s).")
     print(f"Loaded {len(journal_positions)} cached journal position(s).")
 
@@ -1104,6 +1419,7 @@ def main() -> None:
     advance_tier_hint = TemplateSearchHint()
     ready_hint = TemplateSearchHint()
     accept_hint = TemplateSearchHint()
+    laborer_hint = LaborerSearchHint()
     last_ready_monitor_index: Optional[int] = None
     last_laborer_name: Optional[str] = None
     last_action = 0.0
@@ -1127,18 +1443,34 @@ def main() -> None:
             elif is_laborer_action_pressed():
                 now = time.monotonic()
                 if now - last_action >= DEBOUNCE_SECONDS:
+                    if not journal_positions:
+                        print("no journal positions cached yet; press '2' to scan the inventory first.")
+                        last_action = now
+                        time.sleep(POLL_SECONDS)
+                        continue
+
                     original_mouse_position = win32api.GetCursorPos()
                     laborer_future: Optional[Future[Optional[LaborerMatch]]] = None
                     print()
                     print("=" * 48)
                     print("laborer action started.")
                     try:
+                        # Restrict candidates to laborers whose journal was actually
+                        # found in the inventory, so look-alike tiers we don't hold a
+                        # journal for can't be mistaken for the one that's ready.
+                        active_laborer_templates = filter_laborer_templates_by_inventory(
+                            laborer_templates,
+                            mapping,
+                            journal_positions,
+                        )
                         preferred_monitor_index = last_ready_monitor_index
                         laborer_future = laborer_executor.submit(
                             find_laborer_on_screens,
-                            laborer_templates,
+                            active_laborer_templates,
                             last_laborer_name,
                             preferred_monitor_index,
+                            laborer_hint,
+                            laborer_badge_colors,
                         )
                         print("started laborer prefetch.")
 
@@ -1148,6 +1480,7 @@ def main() -> None:
                             hint=take_all_hint,
                         )
                         action_monitor_index = preferred_monitor_index
+                        tier_advanced = False
                         if take_all_match is None:
                             print("take-all image not found.")
                             time.sleep(TAKE_ALL_NOT_FOUND_DELAY_SECONDS)
@@ -1168,6 +1501,7 @@ def main() -> None:
                                 advance_tier_target, action_monitor_index = advance_tier_match
                                 click(advance_tier_target)
                                 print(f"clicked advance-tier at {advance_tier_target}.")
+                                tier_advanced = True
                                 time.sleep(ADVANCE_TIER_RESTORE_DELAY_SECONDS)
                                 restore_mouse(original_mouse_position)
                                 click(original_mouse_position)
@@ -1180,15 +1514,26 @@ def main() -> None:
                         )
                         if ready_monitor_index is not None:
                             last_ready_monitor_index = ready_monitor_index
-                            laborer_match = get_prefetched_laborer(
-                                laborer_future,
-                                ready_monitor_index,
-                            )
+                            laborer_match = None
+                            if tier_advanced:
+                                # advance-tier changes the laborer's sprite/tier, so the
+                                # prefetch (started before the click) reflects the old tier
+                                # and must be discarded in favor of a fresh, post-click scan.
+                                print("tier advanced, discarding prefetch and rechecking laborer image.")
+                                if laborer_future is not None and not laborer_future.done():
+                                    laborer_future.cancel()
+                            else:
+                                laborer_match = get_prefetched_laborer(
+                                    laborer_future,
+                                    ready_monitor_index,
+                                )
                             if laborer_match is None:
                                 laborer_match = check_laborer(
-                                    laborer_templates,
+                                    active_laborer_templates,
                                     ready_monitor_index,
                                     last_laborer_name,
+                                    laborer_hint,
+                                    laborer_badge_colors,
                                 )
 
                             if laborer_match is not None:
@@ -1211,6 +1556,20 @@ def main() -> None:
                                         if click_accept(accept_template, monitor_index, accept_hint):
                                             break
                                         if attempt < ACCEPT_RETRY_ATTEMPTS:
+                                            # If the journal is gone from this position, the
+                                            # first shift-click likely already took it and the
+                                            # accept prompt was just slow/missed. Re-clicking
+                                            # blindly here would hit whatever slot the
+                                            # inventory reflowed into, i.e. the wrong item.
+                                            if not journal_at_position(
+                                                journal_templates[laborer_name],
+                                                journal_position,
+                                            ):
+                                                print(
+                                                    "journal no longer at cached position; "
+                                                    "skipping shift-click retry to avoid the wrong slot."
+                                                )
+                                                break
                                             print("accept timed out, retrying shift click.")
                                             shift_click(journal_position)
                     finally:

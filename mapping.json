@@ -20,5 +20,9 @@
   "t5-tk": "t5-tk",
 
   "t6-bs": "settings",
-  "t6-ft": "settings"
+  "t6-ft": "settings",
+
+  "t8-bs": "t6-bs",
+  "t8-ft": "t6-ft",
+  "t8-imb": "t6-imb"
 }

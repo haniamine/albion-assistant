@@ -38,6 +38,40 @@ Tuning lives in `laborer-v4.config.json`, written with defaults on first run.
 Delete it to start over. Learned state (anchors, journal slots) is in
 `laborer-v4.state.json`; both are gitignored as machine-specific.
 
+## v5: starting a cycle with a left click
+
+```powershell
+python scripts\laborer-v5.py
+```
+
+Same engine, same assets, same config - v5 only changes how a cycle *starts*.
+`"` (the `3` key) arms and disarms a left-click trigger; while it is armed, a
+click in the game runs a cycle, and `&` / `1` keeps working alongside it. Off,
+the action key is the only way in, exactly as in v4. A short rising beep means
+armed, a falling one means off - the console is behind the game.
+
+| Key | Action |
+| --- | --- |
+| `"` / numpad `3` | Arm / disarm the left-click trigger |
+| everything else | As v4 above |
+
+The trigger fires on the button coming *up*, not going down: the engine's first
+act is to inject clicks of its own, and doing that while the physical button is
+still held hands the game a press with no release in between. A click only
+counts while the game is the foreground window and the pointer is inside its
+rect, and no click counts until the button has been seen released - which is
+what stops the engine's own injected clicks from starting another cycle.
+
+Your click is also what *opens* the laborer dialog, and the dialog animates in,
+so a cycle starts one second later (`click_trigger.open_delay`) rather than on
+the frame the click landed - otherwise the engine goes looking for take-all on
+a panel that is not drawn yet, finds nothing, and the empty cycle counts
+against the failure breaker. `Esc` still works during that second. The action
+key skips the gap, since pressing it means the dialog is already open.
+Everything here is under `click_trigger` in `laborer-v5.config.json`, seeded
+from your v4 config and state on first run so nothing has to be re-tuned or
+re-scanned.
+
 ## How v4 works
 
 **Anchored ROIs.** Every element - take-all, advance-tier, ready, accept, the
@@ -74,6 +108,12 @@ with "no t5-bs journal in the inventory" - a supply problem, not a misread.
 until the accept prompt appears, not until the inventory slot looks empty. A
 successful hand-over can therefore never be clicked twice.
 
+**One click, then get out of the way.** Because that signal exists, the
+hand-over is a *single* shift-click; the cursor then moves off the slot so the
+item tooltip stops covering the dialog the accept prompt is drawn in. Only if no
+prompt turns up does v4 come back to the slot and send a slower burst of clicks
+- and only after re-verifying that the journal is still there.
+
 Also: process DPI awareness (v3 only worked at 100% scaling), a foreground
 window gate so typing `1` in a browser cannot start a click sequence, a panic
 key, per-cycle exception containment, a failure circuit breaker, and distinct
@@ -107,11 +147,15 @@ Two things `--selftest` will nag about, both worth fixing:
 
 ```powershell
 python scripts\tests\test_laborer_v4.py
+python scripts\tests\test_laborer_v5.py
 ```
 
 No game, no screen capture, no input: templates are pasted into synthetic
 frames, optionally degraded with sub-pixel shift, gain/bias and noise, and the
 classifier is checked for correctness rather than for not crashing.
+
+The v5 suite covers only what v5 adds - the click trigger's state machine,
+driven over scripted button timelines, and the config layering.
 
 ## Older versions
 

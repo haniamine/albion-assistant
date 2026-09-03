@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 ASSETS_DIR = ROOT_DIR / "assets"
@@ -175,6 +175,11 @@ class TimingConfig:
     advance_tier_settle: float = 0.30
     ready_timeout: float = 0.60
     accept_timeout: float = 1.00
+    # A retry burst is deliberately slow (see input.retry_delay_scale), so the
+    # prompt it produces arrives later than the first click's would. Waiting
+    # only accept_timeout after it would declare failure while the hand-over
+    # the retry just triggered is still animating in.
+    retry_accept_timeout: float = 2.50
     # Pause between the accept prompt first matching and the click on it. The
     # prompt animates in, so the frame where its template crosses the threshold
     # is not the frame where it is stable or interactive - clicking on that
@@ -199,7 +204,12 @@ class TimingConfig:
     restore_mouse_delay: float = 0.25
     # Hard ceiling on one cycle; anything longer means the UI is not in the
     # state we think it is, so bail out to recovery rather than keep clicking.
-    cycle_timeout: float = 15.0
+    # It has to cover the worst legitimate case, which is the full retry ladder:
+    # a fast click plus two deliberately slow bursts, each followed by
+    # retry_accept_timeout, is ~11 s of hand-over on its own. At 15 s the
+    # ceiling fired *during* the last retry and reported a broken UI when the
+    # only thing that had happened was the retry being slow on purpose.
+    cycle_timeout: float = 25.0
 
 
 @dataclass
@@ -216,16 +226,40 @@ class InputConfig:
     click_hold: float = 0.04
     shift_move_delay: float = 0.12
     shift_before_click_delay: float = 0.05
-    shift_click_count: int = 2
+    # One click hands the stack over. v3 sent two because it had no way to tell
+    # a delivered journal from a missed one, so a duplicate looked free; v4 has
+    # the accept prompt as the success signal, which makes the second click pure
+    # downside - it lands after the game has already taken the first and moves
+    # another journal, or it re-opens a prompt that was about to be clicked.
+    shift_click_count: int = 1
     shift_click_hold: float = 0.06
     shift_click_gap: float = 0.05
     shift_after_click_hold: float = 0.10
     shift_release_delay: float = 0.04
     shift_click_attempts: int = 3
+    # A retry means the single click produced no prompt at all, so the game
+    # either never saw it or was still busy redrawing. The retry therefore stops
+    # being gentle: several clicks, with every delay around them multiplied, so
+    # a UI that was mid-frame has time to catch at least one of them. Only ever
+    # reached after the slot has been re-verified as still holding the journal,
+    # so the extra clicks cannot land on something else.
+    retry_shift_click_count: int = 3
+    retry_delay_scale: float = 4.0
     shift_press_attempts: int = 3
     shift_state_settle: float = 0.02
     modifier_release_timeout: float = 0.50
     click_original_after_advance: bool = True
+
+    # --- getting the pointer out of the way ------------------------------
+    # Resting on an inventory slot keeps that item's tooltip open, and the
+    # tooltip is drawn over the dialog - i.e. over the accept prompt we are
+    # about to look for. So the cursor leaves the slot after every hand-over
+    # click, before anything is matched.
+    park_cursor_after_shift_click: bool = True
+    # How far inside the game window the parking spot has to stay. The spot
+    # itself is derived from the window, the bag and the learned dialog box, so
+    # there is no screen coordinate to keep in sync here.
+    cursor_park_margin: int = 40
 
     # --- making sure the game actually receives the shift ----------------
     # Windows routes a click by cursor position and a key by focus. If the game
@@ -286,7 +320,7 @@ class KeyConfig:
 # config file. Writing a new default in the dataclass is not enough on its own:
 # load_config applies the stored file over the defaults, so a value that is
 # already in the file wins and the code change silently does nothing.
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 # version -> {dotted key: (previous default, new default)}. A stored value is
 # only rewritten when it still equals the previous default, i.e. when the
@@ -304,6 +338,16 @@ DEFAULT_CHANGES: Dict[int, Dict[str, Tuple[Any, Any]]] = {
         # search region on the wrong screen. Identity moved to the executable
         # name; the title is now only a tie-break and must be the real one.
         "window.title_contains": (["Albion"], ["Albion Online Client"]),
+    },
+    4: {
+        # The hand-over is one click now. The second click of the pair had no
+        # accept prompt to check itself against and could only ever arrive after
+        # the game had taken the first journal. Retries are where the extra
+        # clicks live, and they run slowly and only on a re-verified slot.
+        "input.shift_click_count": (2, 1),
+        # ...and the retries that replaced it are slow by design, so the cycle
+        # ceiling has to be able to contain them.
+        "timing.cycle_timeout": (15.0, 25.0),
     },
 }
 
@@ -344,9 +388,17 @@ def _apply(target: Any, data: Dict[str, Any], path: str, warnings: List[str]) ->
             setattr(target, key, value)
 
 
-def load_config(path: Path = CONFIG_PATH) -> Tuple[Config, List[str]]:
-    """Load config, creating it with defaults on first run."""
-    config = Config()
+def load_config(
+    path: Path = CONFIG_PATH,
+    factory: Callable[[], Config] = Config,
+) -> Tuple[Config, List[str]]:
+    """Load config, creating it with defaults on first run.
+
+    ``factory`` builds the empty tree the file is applied over, so a later
+    version can add its own sections by subclassing ``Config`` instead of
+    re-implementing the merge, the migration and the write-back.
+    """
+    config = factory()
     warnings: List[str] = []
     if not path.exists():
         save_config(config, path)

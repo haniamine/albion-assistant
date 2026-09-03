@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
@@ -912,6 +913,20 @@ def _mouse_recorder(events: List[tuple]):
     return record
 
 
+def _click_recorder(clicks: List[int]):
+    """Counts left-button presses only, ignoring moves and key events."""
+    def record(*inputs):
+        for item in inputs:
+            if item.type == winput.INPUT_MOUSE and item.union.mi.dwFlags & winput.MOUSEEVENTF_LEFTDOWN:
+                clicks.append(item.union.mi.dwFlags)
+    return record
+
+
+def _shift_only(vk_code: int) -> bool:
+    """Shift is down, ctrl and alt are not - so no modifier wait is paid."""
+    return vk_code in (winput.VK_SHIFT, winput.VK_LEFT_SHIFT)
+
+
 def _focused_driver(config, hwnd: int = 99):
     driver = winput.InputDriver(config.input, target_titles=["Albion"])
     driver.target_hwnd = hwnd
@@ -1031,6 +1046,90 @@ def test_a_rejected_injection_still_releases_the_modifier(config) -> None:
     check(driver._shift_stuck is False, "and the release is not recorded as stuck when the key is up")
 
 
+def test_the_hand_over_starts_with_one_click_and_retries_harder(config) -> None:
+    """One click hands the journal over; the burst is for retries only.
+
+    The pair of clicks the hand-over used to send had nothing to check itself
+    against - the second one could only ever land after the game had already
+    taken the first journal. Extra clicks now happen only after a click that
+    produced no accept prompt, and they go out slowly.
+    """
+    clicks: List[int] = []
+    driver = _focused_driver(config)
+    cursor = FakeCursor([], at=(10, 10))
+    patches = dict(
+        send_input=_click_recorder(clicks), win32api=cursor, win32gui=FakeWin32Gui(),
+        _user32=FakeUser32(), foreground_hwnd=lambda: 99, is_pressed=_shift_only,
+    )
+
+    with patched(winput, **patches):
+        started = time.perf_counter()
+        check(driver.shift_click((400, 300)), "the hand-over click goes out")
+        fast = time.perf_counter() - started
+        check(len(clicks) == 1, f"and it is a single click, not a double (got {len(clicks)})")
+
+        clicks.clear()
+        started = time.perf_counter()
+        check(
+            driver.shift_click((400, 300), clicks=3, delay_scale=4.0),
+            "a retry burst goes out",
+        )
+        slow = time.perf_counter() - started
+
+    check(len(clicks) == 3, f"a retry sends several clicks (got {len(clicks)})")
+    check(slow > 2 * fast, f"and spaces them much further apart ({slow:.2f}s vs {fast:.2f}s)")
+    check(winput._shift_held is False, "the modifier is released either way")
+
+
+def test_the_cursor_parks_clear_of_the_bag_and_the_dialog(library) -> None:
+    """A cursor left on the slot keeps its tooltip over the accept prompt.
+
+    Geometry is the real thing: a 1920x1080 client with the dialog anchors as
+    they were actually learned - the portrait at the top left, the buttons near
+    the bottom of a tall panel down the left of the screen.
+    """
+    print("\n[cursor parking]")
+    from laborer_v4.engine import Geometry, LaborerEngine
+    from laborer_v4.inventory import inventory_rect
+
+    config = Config()
+    state = AppState()
+    state.anchors.origin = (304, 849)
+    state.anchors.offsets = {
+        "accept": (-36, 73),
+        "advance_tier": (-88, 71),
+        "laborer": (-294, -834),
+        "take_all": (-32, 77),
+    }
+
+    engine = LaborerEngine(config, library, state, None, None, None)
+    screen = Rect(0, 0, 1920, 1080)
+    engine.geometry = Geometry(monitor_index=1, monitor=screen, search=screen, window_title="game")
+
+    point = engine._park_position()
+    bag = inventory_rect(screen, config.roi.inventory_left_ratio)
+    panel = engine._panel_region()
+    portrait = engine._anchored_rect("laborer", library.max_laborer_size(), config.roi.dialog_padding)
+    check(point is not None, "a parking spot is found on a normal screen")
+    check(panel is not None, "the learned panel is available to avoid")
+    check(point is not None and not bag.contains_point(point), f"the spot is not in the bag ({point})")
+    check(
+        point is not None and panel is not None and not panel.contains_point(point),
+        f"and not over the panel, where the accept prompt is about to appear ({point})",
+    )
+    # The portrait is the trap: it belongs to the dialog but not to any menu
+    # template, so a region built from the buttons alone leaves it parkable.
+    check(
+        point is not None and portrait is not None and not portrait.contains_point(point),
+        "and not on the laborer portrait at the top of that panel",
+    )
+
+    # A bag that covers the whole window leaves nowhere to go; moving anyway
+    # would only swap one slot's tooltip for another's.
+    config.roi.inventory_left_ratio = 0.0
+    check(engine._park_position() is None, "with nowhere clear to go, the cursor is left where it is")
+
+
 def main() -> int:
     import tempfile
 
@@ -1073,6 +1172,9 @@ def main() -> int:
             lambda: test_a_cursor_already_on_the_slot_still_generates_a_movement(config),
             lambda: test_no_click_is_fired_at_a_position_the_cursor_never_reached(config),
             lambda: test_a_rejected_injection_still_releases_the_modifier(config),
+            lambda: test_the_hand_over_starts_with_one_click_and_retries_harder(config),
+            # Imports the engine, which imports winput - so it belongs here too.
+            lambda: test_the_cursor_parks_clear_of_the_bag_and_the_dialog(library),
         ])
 
     with tempfile.TemporaryDirectory() as directory:

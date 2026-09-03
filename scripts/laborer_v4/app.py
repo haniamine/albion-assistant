@@ -83,9 +83,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def report_startup(config: Config, library, engine: LaborerEngine, hotkeys: Hotkeys, dpi_mode: str) -> None:
+def report_startup(
+    config: Config,
+    library,
+    engine: LaborerEngine,
+    hotkeys: Hotkeys,
+    dpi_mode: str,
+    banner: str = "Albion laborer assistant v4",
+) -> None:
     log.info("=" * 64)
-    log.info("Albion laborer assistant v4")
+    log.info("%s", banner)
     log.info("DPI awareness: %s", dpi_mode)
     log.info(
         "assets: %d laborers (%d stop), %d journals, %d menu elements",

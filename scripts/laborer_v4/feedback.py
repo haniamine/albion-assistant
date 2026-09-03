@@ -82,10 +82,13 @@ class Feedback:
                 time.sleep(0.03)
 
     def play(self, outcome: Outcome) -> None:
-        if not self.enabled:
-            return
         pattern = BEEP_PATTERNS.get(outcome)
-        if not pattern:
+        if pattern:
+            self.play_pattern(pattern)
+
+    def play_pattern(self, pattern: Sequence[Tuple[int, int]]) -> None:
+        """Queue a beep shape directly, for sounds that are not cycle outcomes."""
+        if not self.enabled or not pattern:
             return
         try:
             self._queue.put_nowait(pattern)

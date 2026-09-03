@@ -3,10 +3,12 @@ __pycache__/
 
 # Runtime caches: machine-specific pixel coordinates, not source.
 laborer-v4.state.json
+laborer-v5.state.json
 *.tmp
 
 # Local tuning; delete it and v4 rewrites the defaults.
 laborer-v4.config.json
+laborer-v5.config.json
 
 debug/
 *.log

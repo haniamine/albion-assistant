@@ -910,13 +910,24 @@ class InputDriver:
                 "+".join(held), self.cfg.modifier_release_timeout,
             )
 
-    def shift_click(self, position: Tuple[int, int]) -> bool:
+    def shift_click(
+        self,
+        position: Tuple[int, int],
+        clicks: Optional[int] = None,
+        delay_scale: float = 1.0,
+    ) -> bool:
         """Shift-click ``position``, or do nothing and say so.
 
         Returns True only if every click went out with the OS holding shift and
         the game holding focus. A False return means no *unmodified* click was
         fired either - firing one would pick the journal up onto the cursor, and
         the next retry would then drop it into whatever slot it landed over.
+
+        ``clicks`` and ``delay_scale`` are the retry knobs: the caller sends one
+        click at normal speed first and, if that produced nothing, comes back
+        with more clicks spaced further apart. ``delay_scale`` stretches the
+        pauses around the clicks only - the button *hold* is what the game reads
+        as a click rather than a drag, so it is deliberately left alone.
         """
         self.check_panic()
         self.wait_for_modifier_release()
@@ -928,14 +939,17 @@ class InputDriver:
         # to hold.
         self.preflight_shift()
 
+        count = max(1, int(self.cfg.shift_click_count if clicks is None else clicks))
+        scale = max(1.0, float(delay_scale))
+
         target = (int(position[0]), int(position[1]))
         if not self.move_cursor(target):
             log.error("cursor did not reach %s; not shift-clicking a position we are not on", target)
             return False
-        time.sleep(self.cfg.shift_move_delay)
+        time.sleep(self.cfg.shift_move_delay * scale)
 
         if self.dry_run:
-            log.info("[dry-run] shift-click x%d at %s", self.cfg.shift_click_count, position)
+            log.info("[dry-run] shift-click x%d at %s", count, position)
             return True
 
         clicks_sent = 0
@@ -944,8 +958,8 @@ class InputDriver:
             # Inside the try: once any key-down has gone out, the release has to
             # run no matter what happens next.
             self.shift_down()
-            time.sleep(self.cfg.shift_before_click_delay)
-            for _ in range(max(1, self.cfg.shift_click_count)):
+            time.sleep(self.cfg.shift_before_click_delay * scale)
+            for _ in range(count):
                 # Shift can drop between clicks - a focus steal is enough, and
                 # focus is what decides whether the modifier arrives at all.
                 # Re-press before any click that would otherwise land unmodified
@@ -963,20 +977,21 @@ class InputDriver:
                             "" if self.shift_registered() else " (the OS did not take it either)",
                         )
                         continue
-                # The operator's hand is on the mouse and 100 ms separate the
-                # clicks; a nudge of the physical mouse between them would drop
-                # the second click on a neighbouring slot.
+                # The operator's hand is on the mouse and a retry burst leaves
+                # hundreds of milliseconds between its clicks; a nudge of the
+                # physical mouse in that gap would drop the next click on a
+                # neighbouring slot.
                 if win32api.GetCursorPos() != target and not self.move_cursor(target):
                     all_registered = False
                     log.warning("cursor moved away from %s mid-sequence; stopping here", target)
                     break
                 self.send_left_click(self.cfg.shift_click_hold)
                 clicks_sent += 1
-                time.sleep(self.cfg.shift_click_gap)
-            time.sleep(self.cfg.shift_after_click_hold)
+                time.sleep(self.cfg.shift_click_gap * scale)
+            time.sleep(self.cfg.shift_after_click_hold * scale)
         finally:
             self.shift_up()
-            time.sleep(self.cfg.shift_release_delay)
+            time.sleep(self.cfg.shift_release_delay * scale)
 
         if not all_registered:
             self._explain_lost_shift()

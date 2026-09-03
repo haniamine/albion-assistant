@@ -4,7 +4,7 @@ Shape of one cycle:
 
     COLLECT   click take-all, and advance-tier if it is offered
     IDENTIFY  confirm 'ready', then classify the laborer portrait
-    DELIVER   shift-click the journal until the accept prompt appears
+    DELIVER   shift-click the journal, park the cursor, wait for accept
     ACCEPT    click accept and confirm it disappeared
 
 Two structural differences from v3:
@@ -19,11 +19,16 @@ Two structural differences from v3:
     empty, which conflates "the laborer took it" with "the stack moved" and can
     multiply clicks. Here the shift-click retry loop exits the moment accept
     appears, so a successful hand-over can never be clicked twice.
+
+    That signal is what lets the hand-over start with a *single* click: the
+    cursor then moves off the slot so its tooltip stops covering the dialog,
+    and only if no prompt turns up does the slower retry burst run.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union
@@ -51,6 +56,13 @@ log = logging.getLogger("laborer.engine")
 
 class CycleTimeout(Exception):
     """The cycle exceeded its wall-clock budget; the UI is not where we think."""
+
+
+def _clearance(rect: Rect, point: Tuple[int, int]) -> float:
+    """Distance from ``point`` to the nearest edge of ``rect``; 0 inside it."""
+    dx = max(rect.left - point[0], 0, point[0] - rect.right)
+    dy = max(rect.top - point[1], 0, point[1] - rect.bottom)
+    return math.hypot(dx, dy)
 
 
 @dataclass
@@ -462,6 +474,87 @@ class LaborerEngine:
     # journal hand-over
     # ------------------------------------------------------------------
 
+    def _panel_region(self) -> Optional[Rect]:
+        """The whole laborer panel, portrait included - not just its buttons.
+
+        ``_dialog_region`` is built from the menu templates alone, which on this
+        UI is the button cluster at the bottom of a panel whose portrait sits
+        near the top of the screen. That is the right region to *search* in and
+        the wrong one to *avoid*: parking the cursor by that box alone put it on
+        the portrait, whose tooltip then covered the very prompt being waited
+        for.
+        """
+        dialog = self._dialog_region()
+        portrait = self._anchored_rect(
+            LABORER_ELEMENT, self.library.max_laborer_size(), self.cfg.roi.dialog_padding
+        )
+        if dialog is None:
+            return portrait
+        return dialog if portrait is None else dialog.union(portrait)
+
+    def _park_position(self) -> Optional[Tuple[int, int]]:
+        """The roomiest point in the game window that is neither bag nor dialog.
+
+        A cursor left on the slot it just clicked keeps that item's tooltip
+        open, and the tooltip is drawn over the dialog - which is where the
+        accept prompt appears. Waiting for accept from there is waiting for a
+        button that is covered up, and the same tooltip sits over the
+        neighbouring slots that the retry's re-verification reads.
+
+        "Away" has to mean away from the dialog too, or parking merely moves the
+        occlusion onto the button directly. Both regions are known - the bag is
+        derived from the window width, the dialog box is learned - so the spot
+        is found by sampling the window and keeping the sample furthest from
+        both, rather than by hard-coding a corner that a moved UI would invalidate.
+        """
+        rect = self.search_rect
+        margin = max(0, int(self.cfg.input.cursor_park_margin))
+        inner = rect.inflate(-margin)
+        if inner.width <= 0 or inner.height <= 0:
+            inner = rect
+
+        avoid = [inventory_rect(rect, self.cfg.roi.inventory_left_ratio)]
+        panel = self._panel_region()
+        if panel is not None:
+            avoid.append(panel)
+
+        # Clearance is compared in coarse buckets, and samples that land in the
+        # same bucket are settled by whichever is nearer the middle of the
+        # window. Comparing the raw distance instead picked a sample one pixel
+        # roomier down in the corner over one in the middle of the gap - and the
+        # screen edges are exactly where the rest of the HUD lives.
+        centre = inner.center
+        steps = 12
+        best: Optional[Tuple[int, int]] = None
+        best_key = (0, 0.0)
+        for column in range(steps + 1):
+            x = inner.left + inner.width * column // steps
+            for row in range(steps + 1):
+                y = inner.top + inner.height * row // steps
+                clearance = min(_clearance(box, (x, y)) for box in avoid)
+                key = (int(clearance) // 16, -math.hypot(x - centre[0], y - centre[1]))
+                if clearance > 0 and (best is None or key > best_key):
+                    best_key = key
+                    best = (x, y)
+
+        if best is None:
+            # The bag and the dialog cover everything we are allowed to move to.
+            # Leaving the cursor on the slot is the lesser evil: the next lookup
+            # escalates to a full search anyway, while a blind move could park
+            # the pointer on another slot and swap one tooltip for another.
+            log.debug("nowhere clear of the bag and the dialog to park the cursor")
+        return best
+
+    def park_cursor(self) -> None:
+        """Take the cursor off the slot it just clicked."""
+        if not self.cfg.input.park_cursor_after_shift_click:
+            return
+        point = self._park_position()
+        if point is None:
+            return
+        if self.driver.move_cursor(point):
+            log.debug("parked the cursor at %s, clear of the bag and the dialog", point)
+
     def deliver_journal(self, laborer_name: str) -> Tuple[Optional[Match], Outcome]:
         journal_name = self.library.journal_for(laborer_name)
         if journal_name is None:
@@ -518,30 +611,49 @@ class LaborerEngine:
             if not still_there(position):
                 return None, Outcome.JOURNAL_FAILED
 
+        # First pass: one click, at normal speed. A retry is the slow pass - the
+        # first click produced no prompt at all, so the game either never saw it
+        # or was mid-redraw, and both are answered by more clicks spaced further
+        # apart rather than by repeating the same timing.
         attempts = max(1, self.cfg.input.shift_click_attempts)
         for attempt in range(attempts):
             self._tick()
-            if attempt > 0 and not still_there(position):
+            retry = attempt > 0
+            if retry and not still_there(position):
                 # The slot emptied but no accept prompt appeared. Clicking again
                 # would hit whatever the inventory reflowed into, i.e. the wrong
                 # item, so stop here and report rather than guess.
                 log.warning("'%s' left the slot without an accept prompt; not retrying blind", journal_name)
                 return None, Outcome.JOURNAL_FAILED
 
-            if not self.driver.shift_click(position):
+            clicks = self.cfg.input.retry_shift_click_count if retry else self.cfg.input.shift_click_count
+            scale = self.cfg.input.retry_delay_scale if retry else 1.0
+            # shift_click moves onto the slot itself, which is the move back the
+            # retry needs - the cursor was parked elsewhere after the last click.
+            if not self.driver.shift_click(position, clicks=clicks, delay_scale=scale):
                 # No click was sent, because the game could not be confirmed to
                 # have shift. Retrying cannot change that within this cycle, and
                 # every retry is another chance for a plain click to pick the
                 # journal up onto the cursor. Stop and report.
                 log.error("could not deliver a shift-click to '%s'; nothing was clicked", journal_name)
                 return None, Outcome.JOURNAL_FAILED
-            log.info("shift-clicked '%s' at %s (attempt %d/%d)", journal_name, position, attempt + 1, attempts)
+            log.info(
+                "shift-clicked '%s' x%d at %s%s (attempt %d/%d)",
+                journal_name, max(1, clicks), position,
+                f" at {scale:.0f}x the usual delays" if retry else "",
+                attempt + 1, attempts,
+            )
 
-            accept = self.wait_for_element("accept", self.cfg.timing.accept_timeout)
+            # Before looking at the dialog, not after: the prompt is under the
+            # slot's tooltip until the pointer leaves.
+            self.park_cursor()
+
+            timeout = self.cfg.timing.retry_accept_timeout if retry else self.cfg.timing.accept_timeout
+            accept = self.wait_for_element("accept", timeout)
             if accept is not None:
                 return accept, Outcome.SUCCESS
 
-            log.info("no accept prompt yet after shift-click %d/%d", attempt + 1, attempts)
+            log.info("no accept prompt %.2fs after shift-click %d/%d", timeout, attempt + 1, attempts)
 
         return None, Outcome.JOURNAL_FAILED
 
